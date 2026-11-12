@@ -1,0 +1,102 @@
+[
+  {
+    "jsonrpc": "2.0",
+    "id": 10,
+    "method": "tools/call",
+    "params": { "name": "get_context", "arguments": {} }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 11,
+    "method": "tools/call",
+    "params": { "name": "list_materials", "arguments": { "query": "石砖", "limit": 20 } }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 12,
+    "method": "tools/call",
+    "params": { "name": "read_state", "arguments": { "detail": "summary" } }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 13,
+    "method": "tools/call",
+    "params": {
+      "name": "draw_shape",
+      "arguments": {
+        "region": [0, 64, 0, 15, 64, 15],
+        "block": "minecraft:stone_bricks",
+        "where": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 14,
+    "method": "tools/call",
+    "params": {
+      "name": "draw_shape",
+      "arguments": {
+        "region": [0, 65, 0, 15, 71, 15],
+        "block": "minecraft:stone_bricks",
+        "where": "abs(x-cx)>=rx-0.5 || abs(z-cz)>=rz-0.5",
+        "mode": "add"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 15,
+    "method": "tools/call",
+    "params": {
+      "name": "remove_blocks",
+      "arguments": { "region": [6, 65, 0, 8, 67, 0], "where": "1" }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 16,
+    "method": "tools/call",
+    "params": {
+      "name": "draw_shape",
+      "arguments": {
+        "region": [0, 72, 0, 15, 76, 15],
+        "block": "minecraft:spruce_planks",
+        "where": "y<=y1-abs(x-cx)/rx*(y1-y0) && y>=y1-abs(x-cx)/rx*(y1-y0)-0.6"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 17,
+    "method": "tools/call",
+    "params": {
+      "name": "read_state",
+      "arguments": { "detail": "region", "region": [5, 64, 0, 9, 68, 1] }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 18,
+    "method": "tools/call",
+    "params": {
+      "name": "capture",
+      "arguments": {
+        "cameras": [
+          { "name": "正面", "x": 7.5, "y": 68, "z": -8, "lookAt": [7.5, 68, 7.5], "fov": 80 },
+          { "name": "大厅朝东", "x": 7.5, "y": 66.5, "z": 7.5, "lookAt": [15, 66.5, 7.5], "fov": 95 }
+        ],
+        "reason": "核对墙体、屋顶比例与室内层高"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": 19,
+    "method": "tools/call",
+    "params": {
+      "name": "submit_build",
+      "arguments": { "summary": "石砖小屋，山墙屋顶，一楼大厅带门窗，门洞朝南" }
+    }
+  }
+]
