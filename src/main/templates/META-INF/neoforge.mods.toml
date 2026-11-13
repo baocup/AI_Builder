@@ -15,6 +15,7 @@ loaderVersion="${loader_version_range}" #mandatory
 license="${mod_license}"
 
 # A URL to refer people to when problems occur with this mod
+# TODO 发布前替换成你的仓库地址，例如 https://github.com/<你>/ai-builder/issues
 #issueTrackerURL="https://change.me.to.your.issue.tracker.example.invalid/" #optional
 
 # A list of mods - how many allowed here is determined by the individual mod loader
@@ -44,10 +45,15 @@ displayName="${mod_name}" #mandatory
 # The authors of the mod, displayed in the mod UI (optional)
 authors="baocup"
 
+# A text field displayed in the mod UI
+credits="外部 Agent 链路基于 MCP（JSON-RPC over HTTP）；建造照片为本地软件渲染"
+
 # The description text for the mod (multi line!) (#mandatory)
 description='''
-输入一句想要的建筑大概样子 + 选好坐标范围，Agent 会自主规划并把它建完整。
-包含坐标选择器、建造指令物品、Agent 长链任务、方块外观索引数据库、可持久化任务记忆与 Plan 对话模式。
+输入一句对建筑的描述 + 选好坐标范围，游戏内 LLM Agent 会自主规划并把它建完整。
+
+也可以完全不用游戏内模型：手持「外部建造手杖」，让本地 Agent（Codex / Claude Code /
+Cursor / WorkBuddy 等）通过 MCP 直接建模、拍照与提交方块，全程 0 次模型调用。
 '''
 
 # The [[mixins]] block allows you to declare your mixin config to FML so that it gets loaded.

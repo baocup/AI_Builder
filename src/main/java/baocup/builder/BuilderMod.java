@@ -39,6 +39,8 @@ public class BuilderMod {
      * 由客户端专属类注入。这样公共注册代码无需引用任何客户端类，专用服务器也不会加载它们。
      */
     public static volatile Consumer<ModPackets.S2CState> clientStateHandler = null;
+    /** 由客户端专属类注入：转发服务端查询结果，避免公共代码引用客户端类。 */
+    public static volatile Consumer<ModPackets.S2CQueryResult> clientQueryHandler = null;
 
     public BuilderMod(IEventBus modEventBus, ModContainer container) {
         ModItems.ITEMS.register(modEventBus);
@@ -59,6 +61,17 @@ public class BuilderMod {
         registrar.playToClient(ModPackets.S2CState.TYPE, ModPackets.S2CState.STREAM_CODEC,
                 (payload, context) -> {
                     Consumer<ModPackets.S2CState> handler = clientStateHandler;
+                    if (handler != null) {
+                        handler.accept(payload);
+                    }
+                });
+        registrar.playToServer(ModPackets.C2SQuery.TYPE, ModPackets.C2SQuery.STREAM_CODEC,
+                (payload, context) -> AgentManager.get()
+                        .applyClientQuery(context.player(), payload));
+        registrar.playToClient(ModPackets.S2CQueryResult.TYPE,
+                ModPackets.S2CQueryResult.STREAM_CODEC,
+                (payload, context) -> {
+                    Consumer<ModPackets.S2CQueryResult> handler = clientQueryHandler;
                     if (handler != null) {
                         handler.accept(payload);
                     }

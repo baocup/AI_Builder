@@ -64,6 +64,44 @@ public final class ModPackets {
         }
     }
 
+    /** 客户端向服务端查询真实世界 / 提交状态 / 归档版本。 */
+    public record C2SQuery(String taskId, String requestId, String query, String payload)
+            implements CustomPacketPayload {
+        public static final Type<C2SQuery> TYPE =
+                new Type<>(ResourceLocation.fromNamespaceAndPath(BuilderMod.MODID, "query"));
+        public static final StreamCodec<RegistryFriendlyByteBuf, C2SQuery> STREAM_CODEC = StreamCodec.of(
+                (buf, value) -> {
+                    buf.writeUtf(value.taskId, 128);
+                    buf.writeUtf(value.requestId, 64);
+                    buf.writeUtf(value.query, 64);
+                    buf.writeUtf(value.payload == null ? "{}" : value.payload, MAX_JSON);
+                },
+                buf -> new C2SQuery(buf.readUtf(128), buf.readUtf(64), buf.readUtf(64),
+                        buf.readUtf(MAX_JSON)));
+
+        @Override
+        public Type<? extends CustomPacketPayload> type() {
+            return TYPE;
+        }
+    }
+
+    /** 服务端查询结果，requestId 用于和发起的查询配对。 */
+    public record S2CQueryResult(String requestId, String json) implements CustomPacketPayload {
+        public static final Type<S2CQueryResult> TYPE =
+                new Type<>(ResourceLocation.fromNamespaceAndPath(BuilderMod.MODID, "query_result"));
+        public static final StreamCodec<RegistryFriendlyByteBuf, S2CQueryResult> STREAM_CODEC = StreamCodec.of(
+                (buf, value) -> {
+                    buf.writeUtf(value.requestId, 64);
+                    buf.writeUtf(value.json == null ? "{}" : value.json, MAX_JSON);
+                },
+                buf -> new S2CQueryResult(buf.readUtf(64), buf.readUtf(MAX_JSON)));
+
+        @Override
+        public Type<? extends CustomPacketPayload> type() {
+            return TYPE;
+        }
+    }
+
     public record S2CState(String taskId, boolean open, String json) implements CustomPacketPayload {
         public static final Type<S2CState> TYPE =
                 new Type<>(ResourceLocation.fromNamespaceAndPath(BuilderMod.MODID, "state"));

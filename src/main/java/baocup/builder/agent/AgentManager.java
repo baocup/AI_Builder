@@ -1448,6 +1448,7 @@ public final class AgentManager {
         }
         int restored = 0;
         List<String> missing = new ArrayList<>();
+        Map<String, Integer> restoredByBlock = new java.util.HashMap<>();
         for (PlacedBlock entry : job.placed) {
             BlockPos pos = new BlockPos(entry.x(), entry.y(), entry.z());
             if (!level.isLoaded(pos)) {
@@ -1456,22 +1457,232 @@ public final class AgentManager {
             if (level.getBlockState(pos).getBlock() == entry.state().getBlock()) {
                 continue;
             }
+            String blockId = String.valueOf(net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                    .getKey(entry.state().getBlock()));
             level.setBlock(pos, entry.state(), 2);
             if (level.getBlockState(pos).getBlock() == entry.state().getBlock()) {
                 restored++;
+                restoredByBlock.merge(blockId, 1, Integer::sum);
             } else {
                 job.vanished++;
                 if (missing.size() < 5) {
                     missing.add("(" + entry.x() + "," + entry.y() + "," + entry.z() + ") "
-                            + entry.state().getBlock());
+                            + blockId);
                 }
             }
         }
         if (restored > 0 || job.vanished > 0) {
-            log(job.taskId, "提交", job.vanished > 0 ? "WARN" : "INFO",
-                    "归档前校验：补写 " + restored + " 格，仍缺失 " + job.vanished + " 格"
-                            + (missing.isEmpty() ? "" : "，示例 " + String.join("、", missing)));
+            StringBuilder detail = new StringBuilder("归档前校验：补写 ")
+                    .append(restored).append(" 格");
+            if (!restoredByBlock.isEmpty()) {
+                detail.append("，Top 方块=");
+                restoredByBlock.entrySet().stream()
+                        .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+                        .limit(5)
+                        .forEach(e -> detail.append(e.getKey()).append('×')
+                                .append(e.getValue()).append(' '));
+            }
+            detail.append("，仍缺失 ").append(job.vanished).append(" 格");
+            if (!missing.isEmpty()) {
+                detail.append("，示例 ").append(String.join("、", missing));
+            }
+            log(job.taskId, "提交", job.vanished > 0 ? "WARN" : "INFO", detail.toString());
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 客户端世界查询：read_world / get_build_status / resume
+    // ------------------------------------------------------------------
+
+    /** 客户端查询真实世界与提交状态；结果单独回给发起者，不广播。 */
+    public void applyClientQuery(Player player, ModPackets.C2SQuery payload) {
+        if (server == null || payload == null || !(player instanceof ServerPlayer sp)) {
+            return;
+        }
+        String requestId = payload.requestId();
+        String taskId = payload.taskId();
+        JsonObject out = new JsonObject();
+        out.addProperty("requestId", requestId);
+        out.addProperty("query", payload.query());
+        out.addProperty("taskId", taskId);
+        try {
+            switch (payload.query()) {
+                case "read_world" -> queryReadWorld(sp, payload.payload(), out);
+                case "get_build_status" -> queryBuildStatus(taskId, out);
+                case "resume" -> queryResume(taskId, out);
+                case "list_versions" -> queryListVersions(taskId, out);
+                case "revert" -> queryRevert(taskId, payload.payload(), out);
+                default -> out.addProperty("error", "未知查询：" + payload.query());
+            }
+        } catch (Exception e) {
+            out.addProperty("error", e.getMessage() == null ? e.toString() : e.getMessage());
+        }
+        PacketDistributor.sendToPlayer(sp,
+                new ModPackets.S2CQueryResult(requestId, Json.GSON.toJson(out)));
+    }
+
+    /** 按 region 采样服务端真实方块，带体积与条数上限，避免一次扫平整片地形。 */
+    private void queryReadWorld(ServerPlayer player, String payload, JsonObject out) {
+        JsonObject args = Json.GSON.fromJson(payload, JsonObject.class);
+        JsonArray region = args == null ? null : args.getAsJsonArray("region");
+        if (region == null || region.size() != 6) {
+            out.addProperty("error", "region 需要 [x1,y1,z1,x2,y2,z2] 六个整数");
+            return;
+        }
+        int[] b = new int[6];
+        for (int i = 0; i < 6; i++) {
+            b[i] = region.get(i).getAsInt();
+        }
+        for (int i = 0; i < 3; i++) {
+            if (b[i] > b[i + 3]) {
+                int t = b[i];
+                b[i] = b[i + 3];
+                b[i + 3] = t;
+            }
+        }
+        long volume = (long) (b[3] - b[0] + 1) * (b[4] - b[1] + 1) * (b[5] - b[2] + 1);
+        if (volume > 200000L) {
+            out.addProperty("error", "region 体积 " + volume
+                    + " 过大（上限 200000），请按 y 分层查询");
+            return;
+        }
+        int limit = Math.max(1, Math.min(8192, Json.integer(args, "limit", 4096)));
+        String dimension = player.serverLevel().dimension().location().toString();
+        var level = resolveAnyLevel(server, dimension);
+        JsonArray blocks = new JsonArray();
+        int found = 0;
+        boolean truncated = false;
+        outer:
+        for (int x = b[0]; x <= b[3]; x++) {
+            for (int z = b[2]; z <= b[5]; z++) {
+                for (int y = b[1]; y <= b[4]; y++) {
+                    BlockPos pos = new BlockPos(x, y, z);
+                    if (!level.isLoaded(pos)) {
+                        continue;
+                    }
+                    var state = level.getBlockState(pos);
+                    if (state.isAir()) {
+                        continue;
+                    }
+                    if (found >= limit) {
+                        truncated = true;
+                        break outer;
+                    }
+                    found++;
+                    JsonArray one = new JsonArray();
+                    one.add(x);
+                    one.add(y);
+                    one.add(z);
+                    one.add(String.valueOf(net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                            .getKey(state.getBlock())));
+                    blocks.add(one);
+                }
+            }
+        }
+        out.add("blocks", blocks);
+        out.addProperty("returned", blocks.size());
+        out.addProperty("truncated", truncated);
+        out.addProperty("dimension", dimension);
+        out.add("region", Json.GSON.toJsonTree(b));
+    }
+
+    private void queryBuildStatus(String taskId, JsonObject out) {
+        BuildMemory m = memories.get(taskId);
+        if (m == null) {
+            out.addProperty("error", "任务记忆不存在：" + taskId);
+            return;
+        }
+        CommitJob job = commitJobs.get(taskId);
+        int pending = job == null ? 0 : job.pending.size();
+        out.addProperty("version", m.version);
+        out.addProperty("status", m.status);
+        out.addProperty("stage", m.stage);
+        out.addProperty("blocksPlacedTotal", m.blocksPlacedTotal);
+        out.addProperty("pendingWrites", pending);
+        out.addProperty("writing", pending > 0);
+        out.addProperty("done", "DONE".equals(m.status) && pending == 0);
+        if (job != null) {
+            out.addProperty("received", job.total);
+            out.addProperty("written", job.written);
+            out.addProperty("vanished", job.vanished);
+        }
+    }
+
+    /** 回读归档版本，客户端重启后用它恢复本地 VoxelWorld。 */
+    private void queryResume(String taskId, JsonObject out) {
+        BuildMemory m = memories.get(taskId);
+        if (m == null) {
+            out.addProperty("error", "任务记忆不存在：" + taskId);
+            return;
+        }
+        List<Placement> placements = loadPlacements(taskId, m.version);
+        JsonArray blocks = new JsonArray();
+        for (Placement p : placements) {
+            JsonArray one = new JsonArray();
+            one.add(p.x);
+            one.add(p.y);
+            one.add(p.z);
+            one.add(p.state == null || p.state.isBlank()
+                    ? p.block : p.block + "[" + p.state + "]");
+            blocks.add(one);
+        }
+        out.add("blocks", blocks);
+        out.addProperty("version", m.version);
+        out.addProperty("count", blocks.size());
+        if (m.hasBounds && m.bounds != null) {
+            out.add("bounds", Json.GSON.toJsonTree(m.bounds.toArray()));
+        }
+    }
+
+    /** 列出有归档方块图的版本，供回滚前选择。 */
+    private void queryListVersions(String taskId, JsonObject out) {
+        BuildMemory m = memories.get(taskId);
+        if (m == null) {
+            out.addProperty("error", "任务记忆不存在：" + taskId);
+            return;
+        }
+        JsonArray versions = new JsonArray();
+        for (int v = 0; v <= m.version; v++) {
+            if (!loadPlacements(taskId, v).isEmpty()) {
+                versions.add(v);
+            }
+        }
+        out.add("versions", versions);
+        out.addProperty("current", m.version);
+    }
+
+    /** 回滚：把指定版本的方块图重新排进写入队列，逐 tick 覆盖回去。 */
+    private void queryRevert(String taskId, String payload, JsonObject out) {
+        BuildMemory m = memories.get(taskId);
+        if (m == null) {
+            out.addProperty("error", "任务记忆不存在：" + taskId);
+            return;
+        }
+        JsonObject args = Json.GSON.fromJson(payload, JsonObject.class);
+        int target = args == null ? -1 : Json.integer(args, "version", -1);
+        if (target < 0) {
+            target = Math.max(0, m.version - 1);
+        }
+        List<Placement> placements = loadPlacements(taskId, target);
+        if (placements.isEmpty()) {
+            out.addProperty("error", "v" + target + " 没有可用的方块图，无法回滚");
+            return;
+        }
+        CommitJob job = commitJobs.computeIfAbsent(taskId,
+                id -> new CommitJob(id, m.dimension));
+        for (Placement p : placements) {
+            String full = p.state == null || p.state.isBlank()
+                    ? p.block : p.block + "[" + p.state + "]";
+            job.pending.put(commitSortKey(p.x, p.y, p.z),
+                    new CommitBlock(p.x, p.y, p.z, full));
+        }
+        job.total += placements.size();
+        job.last = true;
+        job.summary = "回滚到 v" + target;
+        m.version++;
+        out.addProperty("revertedTo", target);
+        out.addProperty("queued", placements.size());
+        out.addProperty("note", "方块按 blocksPerTick 排队写入；用 get_build_status 确认是否完成");
     }
 
     private void finishCommitJob(CommitJob job) {

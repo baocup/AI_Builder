@@ -18,6 +18,7 @@ public class BuilderClient {
 
     public BuilderClient(ModContainer container) {
         BuilderMod.clientStateHandler = BuilderClient::onState;
+        BuilderMod.clientQueryHandler = ClientBuildHost.INSTANCE::onQueryResult;
         NeoForge.EVENT_BUS.register(new SelectionInput());
         NeoForge.EVENT_BUS.addListener(BuilderClient::onClientTick);
     }

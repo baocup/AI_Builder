@@ -33,6 +33,7 @@ import baocup.builder.net.ModPackets;
 import baocup.builder.util.Bounds;
 import baocup.builder.util.Json;
 import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.ItemStack;
@@ -49,12 +50,26 @@ public final class ClientBuildHost {
     public static final ClientBuildHost INSTANCE = new ClientBuildHost();
     /** 单包最多多少格方块，留足余量给 1 MiB 协议上限。 */
     private static final int BATCH_BLOCKS = 4096;
-    /** 只在本机做几何 / 渲染，单线程即可，避免和客户端渲染线程抢资源。 */
-    private static final ExecutorService POOL = Executors.newSingleThreadExecutor(runnable -> {
-        Thread thread = new Thread(runnable, "builder-client-host");
-        thread.setDaemon(true);
-        return thread;
-    });
+    /**
+     * 按 taskId 分槽的串行执行器：同一任务恒定落在同一槽（严格串行，杜绝并发乱序覆盖），
+     * 不同任务可并行，线程数固定不随任务数增长。
+     */
+    private static final int POOL_SLOTS = 4;
+    private final ExecutorService[] pools = new ExecutorService[POOL_SLOTS];
+
+    private ExecutorService poolFor(String taskId) {
+        int slot = Math.floorMod(taskId == null ? 0 : taskId.hashCode(), POOL_SLOTS);
+        synchronized (pools) {
+            if (pools[slot] == null) {
+                pools[slot] = Executors.newSingleThreadExecutor(runnable -> {
+                    Thread thread = new Thread(runnable, "builder-client-slot-" + slot);
+                    thread.setDaemon(true);
+                    return thread;
+                });
+            }
+            return pools[slot];
+        }
+    }
 
     private record HeldItem(String taskId, Bounds bounds, String dimension) {
     }
@@ -66,6 +81,10 @@ public final class ClientBuildHost {
             new ConcurrentHashMap<>();
     private McpServer server;
     private int callSeq;
+    /** 等待服务端回包的世界查询；key 是 requestId。 */
+    private final Map<String, CompletableFuture<JsonObject>> pendingQueries = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicInteger querySeq =
+            new java.util.concurrent.atomic.AtomicInteger();
     /** 外部 Agent 请求设定范围后，等服务端把坐标写回物品 NBT 再回执。 */
     private PendingBounds pendingBounds;
 
@@ -98,6 +117,14 @@ public final class ClientBuildHost {
         sessions.clear();
         mainQueue.clear();
         logsByTask.clear();
+        synchronized (pools) {
+            for (int i = 0; i < pools.length; i++) {
+                if (pools[i] != null) {
+                    pools[i].shutdownNow();
+                    pools[i] = null;
+                }
+            }
+        }
     }
 
     /** 客户端每 tick 驱动：主线程队列 + 日志裁剪。 */
@@ -209,7 +236,16 @@ public final class ClientBuildHost {
             }
             JsonObject tool = new JsonObject();
             tool.addProperty("name", name);
-            tool.addProperty("description", Json.str(function, "description", ""));
+            String description = Json.str(function, "description", "");
+            if (AgentTools.CAPTURE.equals(name)) {
+                // 内部 Agent 会收到图片，但 MCP 只回文本；这里的描述必须按外部链路的实际能力来写
+                description = "从独立虚拟相机渲染 PNG 并落盘，用于自检 3D 造型、比例与遮挡。"
+                        + "MCP 不回传图片字节：回执给 captureDir 与 photoPaths（可直接读取的绝对路径）、"
+                        + "cameras（各机位坐标 / 朝向 / insideSolid）、localReport 统计。"
+                        + "环境能读本地文件时请自行打开 PNG，否则用 read_state 核对。"
+                        + "机位与朝向完全由你决定（绝对世界坐标，见参数）。";
+            }
+            tool.addProperty("description", description);
             tool.add("inputSchema", function.getAsJsonObject("parameters"));
             array.add(tool);
         }
@@ -228,6 +264,33 @@ public final class ClientBuildHost {
                             "description":"[x1,y1,z1,x2,y2,z2] 六个绝对坐标"},
                           "reason":{"type":"string","description":"为什么需要这个范围，仅写进日志"}
                         },"required":["bounds"]}"""));
+        array.add(tool("read_world",
+                "读取**服务端真实世界**里指定 region 的非空气方块（不是本地建模状态）。"
+                        + "贴地建造、验收提交结果、确认已有建筑都用它；坐标是绝对世界整数坐标。",
+                """
+                        {"type":"object","properties":{
+                          "region":{"type":"array","items":{"type":"integer"},
+                            "description":"[x1,y1,z1,x2,y2,z2]"},
+                          "limit":{"type":"integer","description":"最多返回多少格，默认 4096，上限 8192"}
+                        },"required":["region"]}"""));
+        array.add(tool("get_build_status",
+                "查询服务端该任务的归档版本、状态、实际写入格数与是否仍在写入队列。"
+                        + "submit_build 是异步的，用它确认是否真的完成了。",
+                "{\"type\":\"object\",\"properties\":{}}"));
+        array.add(tool("resume",
+                "从服务端归档版本恢复本地 VoxelWorld：客户端重启或本地状态丢失后调用，"
+                        + "载入后即可在已有建筑上加建，不必整城重画。",
+                "{\"type\":\"object\",\"properties\":{}}"));
+        array.add(tool("list_versions",
+                "列出该任务所有可回滚的归档版本与当前版本，回滚前先用它确认版本号。",
+                "{\"type\":\"object\",\"properties\":{}}"));
+        array.add(tool("revert",
+                "把世界回滚到某个归档版本：方块按 blocksPerTick 排队写回，"
+                        + "之后用 get_build_status 确认完成。不填 version 默认回到上一版。",
+                """
+                        {"type":"object","properties":{
+                          "version":{"type":"integer","description":"目标版本号，留空为上一版"}
+                        }}"""));
         array.add(tool("submit_build",
                 "把本地建模结果提交给服务器写入世界。几何编译与拍照渲染都已在客户端完成，这一步只发送方块。"
                         + "**每完成一个可独立成立的建造部分就调用一次**（地基 / 墙体 / 屋顶 / 室内），"
@@ -252,8 +315,12 @@ public final class ClientBuildHost {
     private JsonObject callTool(String name, JsonObject args) {
         CompletableFuture<JsonObject> future = new CompletableFuture<>();
         mainQueue.add(() -> dispatch(name, args, future));
+        boolean query = "read_world".equals(name) || "get_build_status".equals(name)
+                || "resume".equals(name) || "list_versions".equals(name)
+                || "revert".equals(name);
+        int timeout = query ? 15 : Math.max(30, BuilderConfig.mcpToolTimeoutSeconds());
         try {
-            return future.get(Math.max(30, BuilderConfig.mcpToolTimeoutSeconds()), TimeUnit.SECONDS);
+            return future.get(timeout, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
             return error("工具 " + name + " 超时（客户端是否卡住 / 是否在单人存档中？）");
         } catch (Exception e) {
@@ -267,6 +334,8 @@ public final class ClientBuildHost {
                 case "get_context" -> future.complete(context());
                 case "request_bounds" -> requestBounds(args, future);
                 case "submit_build" -> submitBuild(args, future);
+                case "read_world", "get_build_status", "resume", "list_versions", "revert"
+                        -> sendQuery(name, args, future);
                 default -> submitTool(name, args, future);
             }
         } catch (Exception e) {
@@ -286,8 +355,29 @@ public final class ClientBuildHost {
         out.addProperty("held", true);
         out.addProperty("taskId", held.taskId() == null ? "" : held.taskId());
         if (held.bounds() != null) {
-            out.add("bounds", Json.GSON.toJsonTree(held.bounds().toArray()));
-            out.addProperty("volume", held.bounds().volume());
+            Bounds bounds = held.bounds();
+            out.add("bounds", Json.GSON.toJsonTree(bounds.toArray()));
+            out.addProperty("volume", bounds.volume());
+            // 选区中心与四角的真实地表高度：贴地建筑不要再靠猜
+            int[] xs = {(bounds.x1 + bounds.x2) / 2, bounds.x1, bounds.x2};
+            int[] zs = {(bounds.z1 + bounds.z2) / 2, bounds.z1, bounds.z2};
+            JsonArray samples = new JsonArray();
+            int lowest = Integer.MAX_VALUE;
+            for (int x : xs) {
+                for (int z : zs) {
+                    int y = sampleGroundY(x, z);
+                    if (y == Integer.MIN_VALUE) {
+                        samples.add(com.google.gson.JsonNull.INSTANCE);
+                    } else {
+                        samples.add(y);
+                        lowest = Math.min(lowest, y);
+                    }
+                }
+            }
+            out.add("groundSamples", samples);
+            if (lowest != Integer.MAX_VALUE) {
+                out.addProperty("groundY", lowest);
+            }
         } else {
             out.addProperty("hint", "还没有选区：可让玩家左键两次 / GUI 手动输入，"
                     + "或调用 request_bounds 由你设定");
@@ -295,8 +385,108 @@ public final class ClientBuildHost {
         Session session = held.taskId() == null ? null : sessions.get(held.taskId());
         out.addProperty("localBlocks", session == null ? 0 : session.world.size());
         out.addProperty("localCaptures", session == null ? 0 : session.captures.size());
-        out.addProperty("note", "几何编译与渲染都在本地；submit_build 只把方块发给服务器");
+        out.addProperty("submitCount", session == null ? 0 : session.submitCount);
+        out.addProperty("pendingDelta", session == null ? 0
+                : Math.max(0, session.world.size() - session.blocksAtLastSubmit));
+        out.addProperty("note", "几何编译与渲染都在本地；submit_build 只提交相对上次的变化，"
+                + "本地删除会以 minecraft:air 传播到世界");
         return out;
+    }
+
+    /** 向服务端发一次查询，等待 S2CQueryResult 回包；超时由 callTool 统一处理。 */
+    private void sendQuery(String query, JsonObject args, CompletableFuture<JsonObject> future) {
+        HeldItem held = held();
+        if (held == null || held.taskId() == null) {
+            future.complete(error("请让玩家手持「外部建造手杖」后再查询"));
+            return;
+        }
+        String requestId = "q" + querySeq.incrementAndGet();
+        pendingQueries.put(requestId, future);
+        future.whenComplete((result, error) -> pendingQueries.remove(requestId));
+        PacketDistributor.sendToServer(new ModPackets.C2SQuery(
+                held.taskId(), requestId, query, Json.GSON.toJson(args)));
+    }
+
+    /** 服务端查询结果回调（网络线程）：只碰线程安全容器，载入世界投递回主线程。 */
+    public void onQueryResult(ModPackets.S2CQueryResult payload) {
+        if (payload == null) {
+            return;
+        }
+        JsonObject json;
+        try {
+            json = Json.GSON.fromJson(payload.json(), JsonObject.class);
+        } catch (Exception e) {
+            json = new JsonObject();
+        }
+        if (json == null) {
+            json = new JsonObject();
+        }
+        if ("resume".equals(Json.str(json, "query", ""))) {
+            JsonObject result = json;
+            mainQueue.add(() -> handleResume(result));
+            return;
+        }
+        CompletableFuture<JsonObject> future = pendingQueries.remove(payload.requestId());
+        if (future != null) {
+            future.complete(json);
+        }
+    }
+
+    /** 把归档版本灌回本地 VoxelWorld，并标记为「已提交」避免重复发送。 */
+    private void handleResume(JsonObject json) {
+        CompletableFuture<JsonObject> future =
+                pendingQueries.remove(Json.str(json, "requestId", ""));
+        if (future == null) {
+            return;
+        }
+        if (json.has("error")) {
+            future.complete(error(Json.str(json, "error", "恢复失败")));
+            return;
+        }
+        String taskId = Json.str(json, "taskId", "");
+        HeldItem held = held();
+        if (held == null || taskId.isBlank() || !taskId.equals(held.taskId())
+                || held.bounds() == null) {
+            future.complete(error("手杖与归档任务不一致或没有选区，无法恢复"));
+            return;
+        }
+        Session session = sessions.computeIfAbsent(taskId,
+                id -> new Session(id, held.bounds()));
+        JsonArray blocks = json.getAsJsonArray("blocks");
+        int loaded = 0;
+        if (blocks != null) {
+            for (JsonElement element : blocks) {
+                try {
+                    JsonArray one = element.getAsJsonArray();
+                    String full = one.get(3).getAsString();
+                    int bracket = full.indexOf('[');
+                    String block = bracket > 0 ? full.substring(0, bracket) : full;
+                    String state = bracket > 0 && full.endsWith("]")
+                            ? full.substring(bracket + 1, full.length() - 1) : "";
+                    session.world.write(new VoxelWorld.WriteResult(),
+                            one.get(0).getAsInt(), one.get(1).getAsInt(), one.get(2).getAsInt(),
+                            block, state, false);
+                    loaded++;
+                } catch (Exception ignored) {
+                    // 跳过坏条目
+                }
+            }
+        }
+        Map<Long, VoxelWorld.Voxel> snapshot = new LinkedHashMap<>();
+        for (VoxelWorld.Voxel voxel : session.world.all()) {
+            snapshot.put(VoxelWorld.key(voxel.x(), voxel.y(), voxel.z()), voxel);
+        }
+        session.lastSubmitted.clear();
+        session.lastSubmitted.putAll(snapshot);
+        session.blocksAtLastSubmit = snapshot.size();
+        session.submitCount++;
+        JsonObject out = new JsonObject();
+        out.addProperty("resumed", loaded);
+        out.addProperty("version", Json.integer(json, "version", 0));
+        out.addProperty("note", "已从归档恢复本地 VoxelWorld，可继续加建；这批方块不会重复提交");
+        future.complete(out);
+        logLine(taskId, "从归档 v" + Json.integer(json, "version", 0)
+                + " 恢复 " + loaded + " 格");
     }
 
     private void submitTool(String name, JsonObject args, CompletableFuture<JsonObject> future) {
@@ -311,7 +501,7 @@ public final class ClientBuildHost {
             return;
         }
         Session session = sessions.computeIfAbsent(held.taskId(), id -> new Session(id, held.bounds()));
-        POOL.submit(() -> {
+        poolFor(held.taskId()).submit(() -> {
             try {
                 ToolExecutor.Outcome outcome = session.executor.execute(
                         new LlmClient.ToolCall("local_" + (++callSeq), name, Json.GSON.toJson(args)));
@@ -322,17 +512,25 @@ public final class ClientBuildHost {
                 } catch (Exception e) {
                     parsed = Json.GSON.toJsonTree(outcome.result);
                 }
+                // 回执统一为扁平结构：placed / rejected / actualBounds 等直接放顶层，
+                // 不再套一层 result（否则按文档读 res["placed"] 恒为 0）
                 JsonObject out = new JsonObject();
-                out.add("result", parsed == null ? new JsonObject() : parsed);
-                // 每轮回执都提醒：建模只在客户端，必须显式提交才会进世界
+                if (parsed != null && parsed.isJsonObject()) {
+                    for (Map.Entry<String, JsonElement> entry
+                            : parsed.getAsJsonObject().entrySet()) {
+                        out.add(entry.getKey(), entry.getValue());
+                    }
+                } else {
+                    out.add("result", parsed == null ? new JsonObject() : parsed);
+                }
                 out.addProperty("localOnly", true);
                 out.addProperty("submitHint",
                         "以上改动只在客户端本地（拍得到、世界看不到）；这一段确认后就立刻 submit_build，"
                                 + "不要攒到最后一次性提交");
-                if (!session.submitted && session.world.size() >= 1500) {
-                    out.addProperty("warning", "本地已累计 " + session.world.size()
-                            + " 格且一次都没提交过：立刻调用 submit_build 把这段落进世界，"
-                            + "否则一旦中断世界会一格都没有");
+                int delta = session.world.size() - session.blocksAtLastSubmit;
+                if (delta >= 1500) {
+                    out.addProperty("warning", "距上次提交已新增 " + delta
+                            + " 格：立刻调用 submit_build 把这段落进世界");
                 }
                 future.complete(out);
                 logLine(held.taskId(), name + " 完成，本地累计 " + session.world.size()
@@ -357,6 +555,16 @@ public final class ClientBuildHost {
         if (pendingBounds != null) {
             future.complete(error("任务 " + shortId(pendingBounds.taskId)
                     + " 的范围请求还在等服务端确认，稍后再试"));
+            return;
+        }
+        // 改选区会移除本地 Session，不能静默丢掉已经建好的东西
+        Session existing = sessions.get(held.taskId());
+        int pending = existing == null ? 0
+                : Math.max(0, existing.world.size() - existing.blocksAtLastSubmit);
+        if (pending > 0) {
+            future.complete(error("还有 " + pending
+                    + " 格建模未提交；改选区会重置本地 VoxelWorld，"
+                    + "请先调用 submit_build 落盘，再调用 request_bounds"));
             return;
         }
         JsonArray box = args.getAsJsonArray("bounds");
@@ -388,7 +596,31 @@ public final class ClientBuildHost {
                 + (reason.isBlank() ? "" : "：" + reason));
     }
 
-    /** 分批发包：每包最多 BATCH_BLOCKS 格，最后一批带 last=true。 */
+    /** 只保留相对上次提交的变化；被删掉的格子以 minecraft:air 返回，让服务端擦除。 */
+    static List<VoxelWorld.Voxel> computeChanges(
+            Map<Long, VoxelWorld.Voxel> previous, Map<Long, VoxelWorld.Voxel> current) {
+        List<VoxelWorld.Voxel> changes = new ArrayList<>();
+        for (Map.Entry<Long, VoxelWorld.Voxel> entry : current.entrySet()) {
+            VoxelWorld.Voxel old = previous.get(entry.getKey());
+            if (old == null || !old.fullState().equals(entry.getValue().fullState())) {
+                changes.add(entry.getValue());
+            }
+        }
+        for (Map.Entry<Long, VoxelWorld.Voxel> entry : previous.entrySet()) {
+            if (!current.containsKey(entry.getKey())) {
+                VoxelWorld.Voxel old = entry.getValue();
+                changes.add(new VoxelWorld.Voxel(old.x(), old.y(), old.z(),
+                        "minecraft:air", ""));
+            }
+        }
+        return changes;
+    }
+
+    /**
+     * 增量提交：只发「自上次提交以来变化的格子」，不再每次全量重发整个 VoxelWorld。
+     * 本地删掉的格子会以 minecraft:air 发给服务端，让删除真正传播到世界。
+     * 每包最多 BATCH_BLOCKS 格，最后一批带 last=true。
+     */
     private void submitBuild(JsonObject args, CompletableFuture<JsonObject> future) {
         HeldItem held = held();
         if (held == null || held.taskId() == null) {
@@ -396,12 +628,30 @@ public final class ClientBuildHost {
             return;
         }
         Session session = sessions.get(held.taskId());
-        if (session == null || session.world.size() == 0) {
-            future.complete(error("本地还没有任何方块；先用 draw_shape / place_blocks 建模"));
+        if (session == null) {
+            future.complete(error("本地还没有任何建模；先用 draw_shape / place_blocks"));
             return;
         }
-        List<VoxelWorld.Voxel> voxels = new ArrayList<>(session.world.all());
-        int total = voxels.size();
+        Map<Long, VoxelWorld.Voxel> current = new LinkedHashMap<>();
+        for (VoxelWorld.Voxel voxel : session.world.all()) {
+            current.put(VoxelWorld.key(voxel.x(), voxel.y(), voxel.z()), voxel);
+        }
+        List<VoxelWorld.Voxel> changes = computeChanges(session.lastSubmitted, current);
+        int removed = 0;
+        for (VoxelWorld.Voxel voxel : changes) {
+            if ("minecraft:air".equals(voxel.fullState())) {
+                removed++;
+            }
+        }
+        if (changes.isEmpty()) {
+            JsonObject out = new JsonObject();
+            out.addProperty("submitted", 0);
+            out.addProperty("note", "自上次提交以来没有任何变化，无需提交；"
+                    + "继续建模或删除后再调用");
+            future.complete(out);
+            return;
+        }
+        int total = changes.size();
         String dimension = dimension();
         String summary = Json.str(args, "summary", "");
         int sent = 0;
@@ -420,7 +670,7 @@ public final class ClientBuildHost {
             }
             JsonArray blocks = new JsonArray();
             for (int i = start; i < end; i++) {
-                VoxelWorld.Voxel voxel = voxels.get(i);
+                VoxelWorld.Voxel voxel = changes.get(i);
                 JsonArray one = new JsonArray();
                 one.add(voxel.x());
                 one.add(voxel.y());
@@ -436,18 +686,23 @@ public final class ClientBuildHost {
                     held.taskId(), dimension, json, end >= total));
             sent += end - start;
         }
-        // 不清空本地世界：服务端是覆盖写入，重复提交同一批是安全的；
-        // 万一服务端写入失败，Agent 还能原样重试，而不是内容已经丢了。
-        session.submitted = true;
-        logLine(held.taskId(), "已提交 " + sent + " 格方块给服务器（" + batches + " 包，约 "
+        session.lastSubmitted.clear();
+        session.lastSubmitted.putAll(current);
+        session.blocksAtLastSubmit = current.size();
+        session.submitCount++;
+        logLine(held.taskId(), "增量提交 " + sent + " 格（新增/修改 " + (total - removed)
+                + "，删除 " + removed + "；" + batches + " 包，约 "
                 + Math.max(1, payloadBytes / 1024) + " KB）"
                 + (summary.isBlank() ? "" : "：" + summary));
         JsonObject out = new JsonObject();
         out.addProperty("submitted", sent);
+        out.addProperty("changed", total - removed);
+        out.addProperty("removed", removed);
+        out.addProperty("localBlocks", current.size());
         out.addProperty("batches", batches);
         out.addProperty("payloadKb", Math.max(1, payloadBytes / 1024));
-        out.addProperty("note", "服务端按 blocksPerTick 分批覆盖写入并归档；"
-                + "本地世界已保留，可安全重复提交，也可继续在其上加建");
+        out.addProperty("note", "只提交了相对上次提交的变化（删除以 minecraft:air 传播）；"
+                + "本地 VoxelWorld 保留，服务端按 blocksPerTick 分批覆盖写入并归档");
         future.complete(out);
     }
 
@@ -472,6 +727,22 @@ public final class ClientBuildHost {
             return new HeldItem(ItemData.taskId(stack), bounds, dimension());
         }
         return null;
+    }
+
+    /** 从客户端已同步的世界里读某列的最高非空气方块，避免 Agent 猜地面高度。 */
+    private static int sampleGroundY(int x, int z) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null) {
+            return Integer.MIN_VALUE;
+        }
+        int max = Math.min(319, mc.level.getMaxBuildHeight() - 1);
+        int min = mc.level.getMinBuildHeight() + 1;
+        for (int y = max; y >= min; y--) {
+            if (!mc.level.getBlockState(new BlockPos(x, y, z)).isAir()) {
+                return y;
+            }
+        }
+        return Integer.MIN_VALUE;
     }
 
     private static String dimension() {
@@ -537,8 +808,10 @@ public final class ClientBuildHost {
         final VoxelWorld world;
         final ToolExecutor executor;
         final List<String> captures = new ArrayList<>();
-        /** 是否已经提交过一次，用于在「攒太多还没提交」时主动警告。 */
-        boolean submitted;
+        /** 上次提交时的体素快照：只发增量，并把本地删掉的格子转成 air 发给服务端。 */
+        final Map<Long, VoxelWorld.Voxel> lastSubmitted = new java.util.HashMap<>();
+        int blocksAtLastSubmit;
+        int submitCount;
 
         Session(String taskId, Bounds bounds) {
             this.taskId = taskId;

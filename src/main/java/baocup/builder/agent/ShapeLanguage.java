@@ -39,6 +39,106 @@ public final class ShapeLanguage {
     private ShapeLanguage() {
     }
 
+    /** 内置变量与函数名：vars 不允许覆盖，否则表达式语义会被悄悄改掉。 */
+    private static final Set<String> RESERVED = Set.of(
+            "x", "y", "z", "cx", "cy", "cz", "rx", "ry", "rz",
+            "x0", "y0", "z0", "x1", "y1", "z1", "t", "i", "n", "pi", "e",
+            "abs", "min", "max", "floor", "ceil", "round", "sqrt", "pow", "sin", "cos",
+            "tan", "atan2", "hypot", "clamp", "step", "smoothstep", "mod", "sign",
+            "lerp", "fract", "dist", "dist2", "length", "mix",
+            "grid", "hash3", "rand", "noise3");
+
+    /**
+     * let 绑定：把 spec.vars 里的命名表达式内联进 where，避免同一个 H 在墙 / 屋顶 / 窗里抄三遍。
+     * 值可以是数字常量，也可以是依赖 x/y/z 的表达式；按 JSON 顺序展开，后定义的变量能引用先展开的结果。
+     */
+    private static String expandVars(String where, JsonObject spec) throws ShapeException {
+        JsonObject vars = spec.has("vars") && spec.get("vars").isJsonObject()
+                ? spec.getAsJsonObject("vars") : null;
+        if (vars == null || vars.isEmpty()) {
+            return where;
+        }
+        String expanded = where;
+        for (Map.Entry<String, JsonElement> entry : vars.entrySet()) {
+            String name = entry.getKey().trim();
+            if (!name.matches("[A-Za-z_][A-Za-z0-9_]*") || RESERVED.contains(name)) {
+                throw new ShapeException("vars 变量名非法或与内置名冲突：" + name);
+            }
+            JsonElement value = entry.getValue();
+            if (value == null || value.isJsonNull()) {
+                throw new ShapeException("vars." + name + " 没有值");
+            }
+            String replacement = value.isJsonPrimitive()
+                    && value.getAsJsonPrimitive().isNumber()
+                    ? value.getAsString() : "(" + value.getAsString() + ")";
+            expanded = expanded.replaceAll(
+                    "\\b" + java.util.regex.Pattern.quote(name) + "\\b",
+                    java.util.regex.Matcher.quoteReplacement(replacement));
+        }
+        return expanded;
+    }
+
+    private record TransformResult(List<int[]> cells, String note) {
+    }
+
+    /** clone 阵列 / mirror 镜像：把一套几何复制到多个位置，不必手改四遍参数。 */
+    private static TransformResult applyTransforms(List<int[]> cells, JsonObject spec)
+            throws ShapeException {
+        JsonObject mirror = spec.has("mirror") && spec.get("mirror").isJsonObject()
+                ? spec.getAsJsonObject("mirror") : null;
+        JsonObject clone = spec.has("clone") && spec.get("clone").isJsonObject()
+                ? spec.getAsJsonObject("clone") : null;
+        if (mirror == null && clone == null) {
+            return new TransformResult(cells, "");
+        }
+        List<int[]> out = new ArrayList<>(cells);
+        StringBuilder note = new StringBuilder();
+        if (mirror != null) {
+            String axis = text(mirror, "axis", "x").trim().toLowerCase(java.util.Locale.ROOT);
+            double at = mirror.has("at") ? mirror.get("at").getAsDouble() : 0.0;
+            int component = switch (axis) {
+                case "x" -> 0;
+                case "y" -> 1;
+                case "z" -> 2;
+                default -> throw new ShapeException("mirror.axis 只能是 x / y / z，收到：" + axis);
+            };
+            for (int[] c : cells) {
+                int[] copied = c.clone();
+                copied[component] = (int) Math.round(2.0 * at - c[component]);
+                out.add(copied);
+            }
+            note.append("；镜像 ").append(axis).append(" @ ").append(at);
+        }
+        if (clone != null) {
+            JsonArray offset = clone.getAsJsonArray("offset");
+            if (offset == null || offset.size() != 3) {
+                throw new ShapeException("clone.offset 必须是 [dx,dy,dz] 三个整数");
+            }
+            int dx = offset.get(0).getAsInt();
+            int dy = offset.get(1).getAsInt();
+            int dz = offset.get(2).getAsInt();
+            int count = Math.max(1, Math.min(64,
+                    clone.has("count") ? clone.get("count").getAsInt() : 2));
+            List<int[]> base = new ArrayList<>(out);
+            for (int k = 1; k < count; k++) {
+                for (int[] c : base) {
+                    out.add(new int[]{c[0] + dx * k, c[1] + dy * k, c[2] + dz * k});
+                }
+            }
+            note.append("；阵列 ").append(count).append(" 份，每份偏移 [")
+                    .append(dx).append(',').append(dy).append(',').append(dz).append(']');
+        }
+        // 副本之间可能重叠，去重后避免同一格被反复写
+        Set<Long> seen = new HashSet<>(out.size() * 2);
+        List<int[]> deduplicated = new ArrayList<>(out.size());
+        for (int[] c : out) {
+            if (seen.add(VoxelWorld.key(c[0], c[1], c[2]))) {
+                deduplicated.add(c);
+            }
+        }
+        return new TransformResult(deduplicated, note.toString());
+    }
+
     /** 把 draw_shape / remove_blocks 的规格编译成体素列表。 */
     public static Compiled compile(JsonObject spec, Bounds selection, int maxCells)
             throws ShapeException {
@@ -56,13 +156,21 @@ public final class ShapeLanguage {
             where = "1";
             note = "未指定 where / shape，按整个 region 填充";
         }
+        where = expandVars(where, spec);
         Expression expression = Expression.compile(where);
 
         long volume = (long) (region[3] - region[0] + 1)
                 * (region[4] - region[1] + 1) * (region[5] - region[2] + 1);
         if (volume > maxCells) {
-            throw new ShapeException("region 体积 " + volume + " 超过单次上限 " + maxCells
-                    + "，请缩小 region 或拆成多次调用");
+            // 这是包围盒格数，不是 where 实际命中的格数；给出可直接照做的拆分方案
+            int calls = (int) Math.ceil((double) volume / maxCells);
+            int height = region[4] - region[1] + 1;
+            int layersPerCall = Math.max(1, (int) Math.ceil((double) height / calls));
+            throw new ShapeException("region 包围盒体积 " + volume + " 超过单次求值上限 "
+                    + maxCells + "（上限按包围盒格数算，与 where 实际命中的格数无关）。"
+                    + "建议按 y 拆成约 " + calls + " 次调用，每次只取 " + layersPerCall
+                    + " 层：x/z 区间保持不变，把 y 区间依次改成 [y0,y0+" + (layersPerCall - 1)
+                    + "]、[y0+" + layersPerCall + ",…] 等。");
         }
 
         double cx = (region[0] + region[3]) / 2.0;
@@ -107,6 +215,9 @@ public final class ShapeLanguage {
             cells = keepShell(cells);
             note += "；只保留外表面";
         }
+        TransformResult transformed = applyTransforms(cells, spec);
+        cells = transformed.cells();
+        note += transformed.note();
         note += "；实际 region=" + java.util.Arrays.toString(region);
         return new Compiled(cells, region, note, volume);
     }
@@ -357,8 +468,49 @@ public final class ShapeLanguage {
                     ? Math.sqrt((x - a[3]) * (x - a[3]) + (y - a[4]) * (y - a[4])
                     + (z - a[5]) * (z - a[5]))
                     : Math.sqrt(x * x + y * y + z * z);
+            // 网格 / 噪声原语：柱网、窗格、行道树、树冠斑驳不必再到外部逐格算
+            case "grid" -> {
+                double period = Math.abs(y) < 1e-9 ? 1 : y;
+                double m = Math.abs(mod(x, period));
+                yield Math.min(m, period - m);
+            }
+            case "hash3", "rand" -> hash3(x, y, z);
+            case "noise3" -> noise3(x, y, z);
             default -> 0;
         };
+    }
+
+    private static double mod(double x, double n) {
+        return n == 0 ? 0 : x - n * Math.floor(x / n);
+    }
+
+    /** 确定性整数哈希，同一坐标永远得到同一个 [0,1) 值。 */
+    private static double hash3(double x, double y, double z) {
+        long h = (long) Math.floor(x) * 374761393L
+                + (long) Math.floor(y) * 668265263L
+                + (long) Math.floor(z) * 2246822519L;
+        h = (h ^ (h >>> 13)) * 1274126177L;
+        h ^= h >>> 16;
+        return (h >>> 11) / (double) (1L << 53);
+    }
+
+    /** 三线性插值的 value noise，输出 [0,1)，可用于树冠深浅、地形起伏。 */
+    private static double noise3(double x, double y, double z) {
+        double ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+        double fx = fade(x - ix), fy = fade(y - iy), fz = fade(z - iz);
+        double c00 = lerp(hash3(ix, iy, iz), hash3(ix + 1, iy, iz), fx);
+        double c10 = lerp(hash3(ix, iy + 1, iz), hash3(ix + 1, iy + 1, iz), fx);
+        double c01 = lerp(hash3(ix, iy, iz + 1), hash3(ix + 1, iy, iz + 1), fx);
+        double c11 = lerp(hash3(ix, iy + 1, iz + 1), hash3(ix + 1, iy + 1, iz + 1), fx);
+        return lerp(lerp(c00, c10, fy), lerp(c01, c11, fy), fz);
+    }
+
+    private static double fade(double t) {
+        return t * t * t * (t * (t * 6 - 15) + 10);
+    }
+
+    private static double lerp(double a, double b, double t) {
+        return a + (b - a) * t;
     }
 
     private static double min(double[] values) {

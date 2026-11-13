@@ -38,6 +38,8 @@ public final class McpServer {
 
     private HttpServer http;
     private ExecutorService pool;
+    /** MCP 规范要求 initialize 回包带 Mcp-Session-Id；宽松模式不强制客户端回传。 */
+    private final String sessionId = java.util.UUID.randomUUID().toString().replace("-", "");
 
     public McpServer(String token, Supplier<JsonArray> toolsSupplier,
                      BiFunction<String, JsonObject, JsonObject> toolCaller) {
@@ -89,11 +91,18 @@ public final class McpServer {
                 respond(exchange, 400, "{\"error\":\"请求不是合法 JSON\"}");
                 return;
             }
+            boolean initialize = containsInitialize(request);
             JsonElement response = dispatch(request);
             if (response == null) {
                 // 通知（notifications/initialized 等）按规范返回 202 且无 body
+                if (initialize) {
+                    exchange.getResponseHeaders().set("Mcp-Session-Id", sessionId);
+                }
                 exchange.sendResponseHeaders(202, -1);
                 return;
+            }
+            if (initialize) {
+                exchange.getResponseHeaders().set("Mcp-Session-Id", sessionId);
             }
             respond(exchange, 200, Json.GSON.toJson(response));
         } finally {
@@ -123,6 +132,26 @@ public final class McpServer {
         try (OutputStream out = exchange.getResponseBody()) {
             out.write(bytes);
         }
+    }
+
+    private static boolean containsInitialize(JsonElement request) {
+        if (request == null || request.isJsonNull()) {
+            return false;
+        }
+        if (request.isJsonArray()) {
+            for (JsonElement element : request.getAsJsonArray()) {
+                if (isInitialize(element)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return isInitialize(request);
+    }
+
+    private static boolean isInitialize(JsonElement element) {
+        return element != null && element.isJsonObject()
+                && "initialize".equals(Json.str(element.getAsJsonObject(), "method", ""));
     }
 
     /** 支持单条与批量 JSON-RPC；通知不产生响应。 */
@@ -188,12 +217,13 @@ public final class McpServer {
         info.addProperty("name", SERVER_NAME);
         info.addProperty("version", SERVER_VERSION);
         result.add("serverInfo", info);
-        JsonObject instructions = new JsonObject();
-        instructions.addProperty("hint",
-                "所有坐标都是绝对世界整数坐标。建造范围由玩家手持「外部建造手杖」选点决定，"
-                        + "Agent 不能修改：先调用 get_context 读取 taskId 与 bounds，"
-                        + "建模完成后用 submit_build 把方块提交给服务端。");
-        result.add("serverInstruction", instructions);
+        // MCP 规范字段是 instructions（原来的 serverInstruction 会被客户端忽略）
+        result.addProperty("instructions",
+                "所有坐标都是绝对世界整数坐标。选区由玩家手杖决定，也可调用 request_bounds 自主设定；"
+                        + "但改选区会重置本地建模，调用前请先 submit_build。"
+                        + "建模只在客户端本地，必须 submit_build 才会写进世界：它只提交相对上次的变化，"
+                        + "本地删除会以 minecraft:air 传播。照片以 captureDir / photoPaths 绝对路径落盘，"
+                        + "MCP 不回传图片字节。");
         return result;
     }
 

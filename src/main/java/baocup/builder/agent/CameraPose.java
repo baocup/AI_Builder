@@ -16,6 +16,12 @@ public final class CameraPose {
     public float yaw;
     public float pitch;
     public float fov = 70.0F;
+    /** 正交投影：所有射线方向相同，俯视大范围时塔顶不会向外发散。 */
+    public boolean orthographic;
+    /** 正交时整幅画面覆盖的世界格数（垂直方向）；<=0 表示按建筑包围盒自动推断。 */
+    public double orthoWidth;
+    /** 占位地面是否画明显的格线；默认开启，便于俯视时判断地面有没有铺满。 */
+    public boolean groundGrid = true;
     public String reason = "";
 
     public CameraPose() {
@@ -49,6 +55,7 @@ public final class CameraPose {
         return id + "「" + name + "」(" + Math.round(x) + "," + Math.round(y)
                 + "," + Math.round(z) + ") yaw=" + Math.round(yaw)
                 + " pitch=" + Math.round(pitch) + " fov=" + Math.round(fov)
+                + (orthographic ? " 正交" : " 透视")
                 + (reason.isEmpty() ? "" : " 目的=" + reason);
     }
 }

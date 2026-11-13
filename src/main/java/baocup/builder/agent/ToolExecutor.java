@@ -102,18 +102,24 @@ public final class ToolExecutor {
         int[] occupied = world.occupiedBounds();
         // 与写入回执统一：占用范围统一叫 occupiedBounds（数组），actualBounds 只在写入回执里表示本次落地范围
         result.add("occupiedBounds", occupied == null ? new JsonArray() : box(occupied));
-        result.addProperty("totalBlocks", world.size());
+        // 空气墓碑不算方块：totalBlocks / materials / layers 都按真实方块统计
+        result.addProperty("totalBlocks", world.realSize());
+        int airMarkers = world.size() - world.realSize();
+        if (airMarkers > 0) {
+            result.addProperty("airMarkers", airMarkers);
+        }
         JsonObject materials = new JsonObject();
         for (Map.Entry<String, Integer> e : world.materials().entrySet()) {
             materials.addProperty(e.getKey(), e.getValue());
         }
         result.add("materials", materials);
-        result.add("layers", world.layerSummary());
 
         if ("summary".equals(detail)) {
+            // 全量分层表只在总览里给；region / full 查询不该被 76 层统计淹没
+            result.add("layers", world.layerSummary());
             result.addProperty("detail", "summary");
             outcome.result = Json.GSON.toJson(result);
-            outcome.log = "读取状态摘要：" + world.size() + " 格";
+            outcome.log = "读取状态摘要：" + world.realSize() + " 格真实方块";
             return;
         }
         List<VoxelWorld.Voxel> voxels;
@@ -126,15 +132,24 @@ public final class ToolExecutor {
             voxels = world.inRegion(region);
             result.add("region", box(region));
         } else {
-            voxels = world.all();
+            voxels = new ArrayList<>(world.all());
         }
-        boolean truncated = voxels.size() > maxBlocks;
+        List<VoxelWorld.Voxel> solid = new ArrayList<>(voxels.size());
+        for (VoxelWorld.Voxel v : voxels) {
+            if (!VoxelWorld.isAir(v)) {
+                solid.add(v);
+            }
+        }
+        if ("region".equals(detail)) {
+            result.add("regionOccupied", occupiedBoxOf(solid));
+        }
+        boolean truncated = solid.size() > maxBlocks;
         result.addProperty("detail", detail);
-        result.addProperty("returnedBlocks", Math.min(voxels.size(), maxBlocks));
+        result.addProperty("returnedBlocks", Math.min(solid.size(), maxBlocks));
         result.addProperty("truncated", truncated);
         JsonArray blocks = new JsonArray();
-        for (int i = 0; i < Math.min(voxels.size(), maxBlocks); i++) {
-            VoxelWorld.Voxel v = voxels.get(i);
+        for (int i = 0; i < Math.min(solid.size(), maxBlocks); i++) {
+            VoxelWorld.Voxel v = solid.get(i);
             JsonArray item = new JsonArray();
             item.add(v.x());
             item.add(v.y());
@@ -144,11 +159,30 @@ public final class ToolExecutor {
         }
         result.add("blocks", blocks);
         if (truncated) {
-            result.addProperty("hint", "体素超过 " + maxBlocks
-                    + " 格，已截断；请用 detail=region 分批查询，或用 layers 定位后缩小范围");
+            result.addProperty("hint", "真实方块超过 " + maxBlocks
+                    + " 格，已截断；请用 detail=region 分批查询，或先 detail=summary 用 layers 定位");
         }
         outcome.result = Json.GSON.toJson(result);
-        outcome.log = "读取建筑状态：" + detail + "，返回 " + Math.min(voxels.size(), maxBlocks) + " 格";
+        outcome.log = "读取建筑状态：" + detail + "，返回 "
+                + Math.min(solid.size(), maxBlocks) + " 格真实方块（空气已排除）";
+    }
+
+    /** 只算这一批非空气体素的局部包围盒，不返回全量分层表。 */
+    private static JsonArray occupiedBoxOf(List<VoxelWorld.Voxel> solid) {
+        if (solid.isEmpty()) {
+            return new JsonArray();
+        }
+        int[] b = {Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE,
+                Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MIN_VALUE};
+        for (VoxelWorld.Voxel v : solid) {
+            b[0] = Math.min(b[0], v.x());
+            b[1] = Math.min(b[1], v.y());
+            b[2] = Math.min(b[2], v.z());
+            b[3] = Math.max(b[3], v.x());
+            b[4] = Math.max(b[4], v.y());
+            b[5] = Math.max(b[5], v.z());
+        }
+        return box(b);
     }
 
     private void listMaterials(JsonObject args, Outcome outcome) {
@@ -181,6 +215,34 @@ public final class ToolExecutor {
             lines.add(line);
         }
         result.add("materials", lines);
+        // 结构化字段：物理特性不再只混在描述文字里，生物群系着色的方块显式标注颜色不可信
+        JsonArray details = new JsonArray();
+        for (BlockIndex.BlockInfo info : palette) {
+            JsonObject item = new JsonObject();
+            item.addProperty("id", info.id);
+            item.addProperty("name", info.name);
+            item.addProperty("hex", info.hex);
+            item.addProperty("category", info.category);
+            String note = info.physics == null ? "" : info.physics;
+            JsonObject physics = new JsonObject();
+            physics.addProperty("gravity", note.contains("重力") || note.contains("掉落"));
+            physics.addProperty("needsSupport", note.contains("需支撑") || note.contains("重力"));
+            physics.addProperty("randomTick", note.contains("随机刻") || note.contains("融化")
+                    || note.contains("蔓延") || note.contains("生长"));
+            physics.addProperty("note", note);
+            item.add("physics", physics);
+            String id = info.id.toLowerCase(java.util.Locale.ROOT);
+            boolean tinted = id.endsWith("_leaves") || id.equals("minecraft:grass_block")
+                    || id.equals("minecraft:grass") || id.equals("minecraft:tall_grass")
+                    || id.equals("minecraft:vine") || id.equals("minecraft:lily_pad")
+                    || id.contains("mycelium");
+            item.addProperty("biomeTinted", tinted);
+            if (tinted) {
+                item.addProperty("colorNote", "游戏内颜色随生物群系变化；hex 为贴图平均色，不代表实际观感");
+            }
+            details.add(item);
+        }
+        result.add("materialDetails", details);
         result.addProperty("hint", "这不是全局固定清单：建造过程中随时可以用不同 query 重新查询、"
                 + "加大 limit 或翻 offset 查更多材料；写入工具接受任何合法的 minecraft: 方块 id。"
                 + "带「受重力影响 / 需支撑」说明的方块必须放在有实心支撑的位置");
@@ -267,6 +329,14 @@ public final class ToolExecutor {
         result.addProperty("note", compiled.note());
         result.addProperty("evaluatedCells", compiled.evaluated());
         result.add("compiledRegion", box(compiled.actualRegion()));
+        long evaluated = compiled.evaluated();
+        double ratio = evaluated <= 0 ? 0.0 : (double) write.placed / evaluated;
+        result.addProperty("hitRatio", Math.round(ratio * 10000) / 10000.0);
+        if (evaluated > 100 && ratio < 0.05) {
+            result.addProperty("hint", "命中率仅 " + (Math.round(ratio * 10000) / 100.0)
+                    + "%：region 与 where 很可能不匹配，先用 read_state(detail=region) "
+                    + "核对墙体/地面实际所在坐标，别按记忆里的区间继续画");
+        }
         outcome.result = Json.GSON.toJson(result);
         outcome.log = "形状编译：" + compiled.note() + "；写入 " + write.placed
                 + " 格 / 清除 " + write.removed + " 格";
@@ -275,6 +345,8 @@ public final class ToolExecutor {
     private void removeBlocks(JsonObject args, Outcome outcome) throws ShapeLanguage.ShapeException {
         VoxelWorld.WriteResult write = new VoxelWorld.WriteResult();
         int cap = BuilderConfig.agentMaxBlocksPerCall();
+        java.util.Set<String> filter = blockFilter(args);
+        boolean hasFilter = !filter.isEmpty();
         JsonArray blocks = args.getAsJsonArray("blocks");
         if (blocks != null) {
             int seen = 0;
@@ -286,18 +358,21 @@ public final class ToolExecutor {
                 }
                 try {
                     JsonArray item = element.getAsJsonArray();
-                    world.erase(write, item.get(0).getAsInt(), item.get(1).getAsInt(),
-                            item.get(2).getAsInt());
+                    int x = item.get(0).getAsInt(), y = item.get(1).getAsInt(),
+                            z = item.get(2).getAsInt();
+                    if (matchesBlock(filter, world.get(x, y, z))) {
+                        world.erase(write, x, y, z);
+                    }
                 } catch (Exception ignored) {
                     // 忽略坏条目
                 }
             }
         }
         if (args.has("region")) {
-            boolean hasCondition = args.has("where") || args.has("shape");
+            boolean hasCondition = args.has("where") || args.has("shape") || hasFilter;
             boolean all = args.has("all") && args.get("all").getAsBoolean();
             if (!hasCondition && !all) {
-                outcome.result = error("为避免误删，remove_blocks 的 region 必须配 where 或 shape；"
+                outcome.result = error("为避免误删，remove_blocks 的 region 必须配 where / shape / block；"
                         + "若确实要清空整个 region，请显式传 all=true（仍受单次删除上限约束）。"
                         + "建议先用 read_state(detail=region) 确认范围");
                 return;
@@ -313,6 +388,10 @@ public final class ToolExecutor {
             if (args.has("params")) {
                 spec.add("params", args.get("params"));
             }
+            if (!args.has("where") && !args.has("shape")) {
+                // 只有类型过滤时全选该 region，再按方块 id 筛
+                spec.addProperty("where", "1");
+            }
             ShapeLanguage.Compiled compiled = ShapeLanguage.compile(spec, bounds,
                     BuilderConfig.agentMaxCellsPerCall());
             int used = 0;
@@ -322,16 +401,64 @@ public final class ToolExecutor {
                             "单次删除超过 " + cap + " 格上限，其余已忽略"));
                     break;
                 }
-                world.erase(write, cell[0], cell[1], cell[2]);
+                if (matchesBlock(filter, world.get(cell[0], cell[1], cell[2]))) {
+                    world.erase(write, cell[0], cell[1], cell[2]);
+                }
+            }
+        } else if (hasFilter) {
+            // 不给 region 时按类型删整个本地世界
+            int used = 0;
+            for (VoxelWorld.Voxel v : new ArrayList<>(world.all())) {
+                if (used++ >= cap) {
+                    write.rejections.add(new VoxelWorld.Rejection(0, 0, 0,
+                            "单次删除超过 " + cap + " 格上限，其余已忽略"));
+                    break;
+                }
+                if (matchesBlock(filter, v)) {
+                    world.erase(write, v.x(), v.y(), v.z());
+                }
             }
         }
-        if (blocks == null && !args.has("region")) {
-            outcome.result = error("remove_blocks 需要 blocks 或 region");
+        if (blocks == null && !args.has("region") && !hasFilter) {
+            outcome.result = error("remove_blocks 需要 blocks / region / block 之一");
             return;
         }
         outcome.result = writeResult("remove_blocks", write);
         outcome.log = "删除方块：" + write.removed + " 格"
+                + (hasFilter ? "（按类型 " + String.join("、", filter) + "）" : "")
                 + (write.rejections.isEmpty() ? "" : "，被拒 " + write.rejections.size() + " 条");
+    }
+
+    /** block 可以是单个 id 字符串，也可以是 blockIds 数组；统一补上命名空间。 */
+    private static java.util.Set<String> blockFilter(JsonObject args) {
+        java.util.Set<String> ids = new java.util.HashSet<>();
+        JsonElement value = args.get("block");
+        if (value == null) {
+            value = args.get("blockIds");
+        }
+        if (value == null) {
+            return ids;
+        }
+        if (value.isJsonPrimitive()) {
+            ids.add(normalizeBlockId(value.getAsString()));
+        } else if (value.isJsonArray()) {
+            for (JsonElement element : value.getAsJsonArray()) {
+                ids.add(normalizeBlockId(element.getAsString()));
+            }
+        }
+        return ids;
+    }
+
+    private static String normalizeBlockId(String id) {
+        String text = id.trim().toLowerCase(java.util.Locale.ROOT);
+        return text.contains(":") ? text : "minecraft:" + text;
+    }
+
+    private static boolean matchesBlock(java.util.Set<String> filter, VoxelWorld.Voxel v) {
+        if (filter.isEmpty()) {
+            return true;
+        }
+        return v != null && filter.contains(normalizeBlockId(v.block()));
     }
 
     // ------------------------------------------------------------------
@@ -341,6 +468,10 @@ public final class ToolExecutor {
     private void capture(JsonObject args, Outcome outcome) {
         String view = Json.str(args, "view", "around");
         String reason = Json.str(args, "reason", "");
+        boolean orthoSet = args.has("orthographic");
+        boolean ortho = orthoSet && args.get("orthographic").getAsBoolean();
+        double orthoWidth = Math.max(0, Json.dbl(args, "orthoWidth", 0));
+        boolean groundGrid = !args.has("groundGrid") || args.get("groundGrid").getAsBoolean();
         int maxCameras = Math.max(1, Math.min(
                 Json.integer(args, "maxCameras", BuilderConfig.visionMaxImages()),
                 BuilderConfig.visionMaxImages()));
@@ -373,6 +504,9 @@ public final class ToolExecutor {
                                 (float) Json.dbl(o, "pitch", 0), why);
                     }
                     pose.fov = fov;
+                    pose.orthographic = o.has("orthographic")
+                            ? o.get("orthographic").getAsBoolean() : ortho;
+                    pose.orthoWidth = Json.dbl(o, "orthoWidth", orthoWidth);
                     poses.add(pose);
                 } catch (Exception ignored) {
                     // 单台机位参数非法时跳过，不影响其余机位
@@ -386,13 +520,28 @@ public final class ToolExecutor {
             }
             int count = "all".equals(view) ? BuilderConfig.VISUAL_VIEWS.getAsInt()
                     : Math.min(4, BuilderConfig.visionInspectionImages());
-            List<CameraPose> all = CameraRig.around(bounds, Math.max(4, count));
-            if ("top".equals(view)) {
-                poses.add(all.get(all.size() - 2));
-            } else if ("eye".equals(view)) {
-                poses.add(all.get(all.size() - 1));
+            if ("plan".equals(view)) {
+                // 正投影俯视：塔楼顶部不会按透视向外发散，适合核对街区位置
+                double cx = (bounds.minX() + bounds.maxX()) / 2.0;
+                double cz = (bounds.minZ() + bounds.maxZ()) / 2.0;
+                double top = bounds.maxY() + Math.max(24.0,
+                        Math.max(bounds.sizeX(), bounds.sizeZ()) * 0.9);
+                CameraPose plan = new CameraPose("plan", "正投影俯视", cx, top, cz,
+                        0.0F, 90.0F, reason);
+                plan.orthographic = true;
+                plan.orthoWidth = Math.max(bounds.sizeX(), bounds.sizeZ()) * 1.15;
+                poses.add(plan);
             } else {
-                poses.addAll(CameraRig.representative(bounds, Math.min(count, all.size())));
+                List<CameraPose> all = CameraRig.around(bounds, Math.max(4, count));
+                if ("top".equals(view)) {
+                    CameraPose top = all.get(all.size() - 2);
+                    top.orthographic = true;
+                    poses.add(top);
+                } else if ("eye".equals(view)) {
+                    poses.add(all.get(all.size() - 1));
+                } else {
+                    poses.addAll(CameraRig.representative(bounds, Math.min(count, all.size())));
+                }
             }
             while (poses.size() > maxCameras) {
                 poses.remove(poses.size() - 1);
@@ -400,6 +549,42 @@ public final class ToolExecutor {
         }
         captureIndex++;
         String prefix = "v" + (version + 1) + "-agent" + captureIndex;
+        // 机位卡在实心方块里会渲染出 100% 实心的废图：先向上外移找空气，找不到就丢弃
+        List<CameraPose> usable = new ArrayList<>();
+        int relocatedCameras = 0;
+        int droppedCameras = 0;
+        for (CameraPose pose : poses) {
+            int px = (int) Math.floor(pose.x);
+            int py = (int) Math.floor(pose.y);
+            int pz = (int) Math.floor(pose.z);
+            if (world.get(px, py, pz) == null) {
+                usable.add(pose);
+                continue;
+            }
+            boolean moved = false;
+            for (int up = 1; up <= 8; up++) {
+                if (world.get(px, py + up, pz) == null) {
+                    pose.y = py + up + 0.5;
+                    usable.add(pose);
+                    relocatedCameras++;
+                    moved = true;
+                    break;
+                }
+            }
+            if (!moved) {
+                droppedCameras++;
+            }
+        }
+        poses = usable;
+        for (CameraPose pose : poses) {
+            pose.groundGrid = groundGrid;
+            if (orthoSet) {
+                pose.orthographic = ortho;
+            }
+            if (orthoWidth > 0) {
+                pose.orthoWidth = orthoWidth;
+            }
+        }
         VisualInspection.Batch batch = VisualInspection.capture(taskId, version + 1, bounds,
                 world.placements(), poses, captureDir,
                 BuilderConfig.VISUAL_WIDTH.getAsInt(), BuilderConfig.VISUAL_HEIGHT.getAsInt(),
@@ -439,6 +624,8 @@ public final class ToolExecutor {
         result.addProperty("tool", "capture");
         result.addProperty("photos", batch.images.size());
         result.addProperty("reason", reason);
+        result.addProperty("relocatedCameras", relocatedCameras);
+        result.addProperty("droppedCameras", droppedCameras);
         result.addProperty("coordinateSystem",
                 "相机位置与 lookAt 均为绝对世界坐标；yaw=0 朝 +Z、90 朝 -X，pitch 正值朝下，fov 单位度");
         result.add("cameras", cameraInfo);
@@ -457,7 +644,20 @@ public final class ToolExecutor {
                 + "；照片只含本次建造生成的方块，天空渐变与绿色棋盘格草地是占位背景，"
                 + "真实地形 / 植被 / 相邻建筑 / 实体 / 光照都没有渲染，不要据此判断周边环境");
         result.addProperty("localReport", batch.localReport);
-        result.addProperty("totalBlocks", world.size());
+        result.addProperty("totalBlocks", world.realSize());
+        // 照片落盘位置：MCP 不回传图片字节，必须给可直接读取的绝对路径
+        result.addProperty("captureDir", captureDir.toAbsolutePath().toString());
+        JsonArray photoPaths = new JsonArray();
+        for (BuildMemory.CaptureLine line : batch.lines) {
+            if (line != null && line.path != null && !line.path.isBlank()) {
+                try {
+                    photoPaths.add(Path.of(line.path).toAbsolutePath().toString());
+                } catch (Exception ignored) {
+                    photoPaths.add(line.path);
+                }
+            }
+        }
+        result.add("photoPaths", photoPaths);
         if (external) {
             // 拍照是「这一段做完了」的自然决策点，这里直接提醒提交，避免攒到最后忘掉
             result.addProperty("submitHint",
@@ -479,7 +679,7 @@ public final class ToolExecutor {
         outcome.title = Json.str(args, "title", "");
         JsonObject result = new JsonObject();
         result.addProperty("accepted", true);
-        result.addProperty("totalBlocks", world.size());
+        result.addProperty("totalBlocks", world.realSize());
         result.addProperty("captures", captureCount);
         result.addProperty("message", "建造完成，正在归档版本");
         outcome.result = Json.GSON.toJson(result);
@@ -513,7 +713,7 @@ public final class ToolExecutor {
                 result.add("rejectionSamples", shown);
             }
         }
-        result.addProperty("totalBlocks", world.size());
+        result.addProperty("totalBlocks", world.realSize());
         int[] occupied = world.occupiedBounds();
         result.add("occupiedBounds", occupied == null ? new JsonArray() : box(occupied));
         result.add("selection", box(bounds.toArray()));

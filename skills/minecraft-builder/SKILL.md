@@ -59,7 +59,8 @@ url = "http://127.0.0.1:8765/mcp"
 2. **选区有三种确定方式**：玩家左键两次、玩家在 GUI 里手动输入坐标、你调用 `request_bounds` 自主设定（会写回玩家的手杖并立即生效，不需要额外确认）。之后 `get_context` 返回的 `bounds` 就是你本轮能写的全部空间，超出会逐条拒绝；想调整就再调一次 `request_bounds`。
 3. **坐标是绝对世界整数坐标**，与 `read_state`、`get_context` 返回的完全一致。不要用相对坐标，也不要按"建筑中心"猜。
 4. **本地世界只装本轮新放的方块。** 客户端不会把世界里已有建筑读进来，所以 `read_state` 看不到你提交之前就存在的东西（第二次及以后建模时尤其要注意）。
-5. **建模只在客户端，`submit_build` 才是"放进世界"。** 每轮工具回执都带 `localOnly:true` 与 `submitHint`——照片、`read_state`、体素都只在本地，世界看不到。`submit_build` 后本地世界**保留**（服务端是覆盖写入），你可以继续加建并再次提交；重复提交同一批不会出错。
+5. **建模只在客户端，`submit_build` 才是"放进世界"。** 每轮工具回执都带 `localOnly:true` 与 `submitHint`——照片、`read_state`、体素都只在本地，世界看不到。`submit_build` 只提交增量变化，本地世界保留，可以持续加建；无变化时返回 `submitted:0`。
+6. **地面高度不要猜，用 `get_context` 的 `groundY` / `groundSamples`。** 这是客户端从真实世界采样的最高非空气方块（选区中心与四角共 9 点，`groundY` 取其中最低值），不是 `bounds.y1`，也不需要去读 `level.dat`。采样值 `null` 表示那一列的区块还没加载。贴地建筑先拿 `groundY` 再定 y 坐标。
 
 ## 推荐流程
 
@@ -75,17 +76,32 @@ url = "http://127.0.0.1:8765/mcp"
 
 | 工具 | 说明 |
 | --- | --- |
-| `get_context` | **入口**，无参数：读手持手杖的 `taskId` / `bounds` / `volume` 与本轮 `localBlocks` / `localCaptures` |
-| `request_bounds` | 自主设定选区：`bounds: [x1,y1,z1,x2,y2,z2]`，走与 GUI「应用坐标」相同的服务端通道 |
-| `read_state` | 读本地体素，`detail=summary/full/region` |
-| `list_materials` | 按关键词查方块、外观与物理特性；`limit`/`offset` 翻页 |
-| `place_blocks` | 放单个 / 一批方块：`blocks: [[x,y,z,"minecraft:..."]]`，`mode=set/add` |
-| `draw_shape` | `region` + `where` 数学谓词或 `shape` 快捷形状，一次生成一片 |
-| `remove_blocks` | 局部删除；`region` 必须配 `where`/`shape`，或显式 `all=true` |
-| `capture` | 离屏渲染拍照，任意机位，可一次多台相机 |
-| `submit_build` | 把本轮方块分批发给服务端写入世界（每包 4096 格），可选 `summary` |
+| `get_context` | **入口**，无参数：`taskId` / `bounds` / `volume`、真实地表 `groundY` + `groundSamples`、累计 `localBlocks` / `pendingDelta` / `submitCount` |
+| `request_bounds` | 自主设定选区；有未提交增量时会拒绝，避免静默清空 |
+| `read_state` | 读本地**真实方块**（排除空气墓碑）；`detail=summary` 才带全量 `layers`，`region` 只给 `regionOccupied` |
+| `read_world` | **读服务端真实世界**：`region` + `limit`，返回非空气方块；贴地建造与提交验收用它 |
+| `get_build_status` | 服务端归档版本 / `status` / `pendingWrites` / `done` / `written` |
+| `resume` | 从服务端归档恢复本地 VoxelWorld，客户端重启后可继续加建 |
+| `list_versions` | 列出可回滚版本与当前版本 |
+| `revert` | 回滚到指定版本（默认上一版），方块按 tick 写回 |
+| `list_materials` | 方块检索；回执含 `materialDetails`（结构化 `physics` 与 `biomeTinted` 标注） |
+| `place_blocks` | 放单个 / 一批方块；写 `minecraft:air` 即删除 |
+| `draw_shape` | `region` + `where` / `shape`；支持 `vars` / `clone` / `mirror`；回执含 `hitRatio`，命中率过低会提示 |
+| `remove_blocks` | 坐标列表、区域谓词，或 `block` / `blockIds` 按类型删除 |
+| `capture` | 离屏渲染 PNG；`view=plan` 或 `orthographic:true` 走正交俯视；回执给 `captureDir` / `photoPaths` 绝对路径；实心内机位自动外移或丢弃 |
+| `submit_build` | 只提交相对上次的变化（含删除，4096 格/包），可选 `summary` |
 
-`tools/list` 返回的就是权威参数 schema，以它为准。
+`tools/list` 返回的就是权威参数 schema，以它为准。**所有工具回执都是扁平 JSON**：`placed` / `rejected` / `actualBounds` 等字段直接在顶层，没有 `{"result": ...}` 包装；`submit_build` 同样是扁平的 `submitted` / `changed` / `removed`。
+
+## 服务端查询、验收与回滚
+
+`read_state` 只看客户端本地建模，下面这些工具走 `C2SQuery` 到服务端，用来解决「世界里到底有什么」：
+
+- **贴地建造**：先 `get_context` 拿 `groundY`，再用 `read_world({"region":[x1,y1,z1,x2,y2,z2],"limit":4096})` 确认地表与已有建筑。region 体积上限 200000，超过要按 y 分层查；`read_world` 只返回非空气方块。
+- **验收提交**：`submit_build` 是异步的（服务端按 `blocksPerTick` 逐 tick 写）。调 `get_build_status` 看 `done` / `pendingWrites` / `written` / `version`，不用去翻 `logs/latest.log`。
+- **断点续建**：客户端关闭后本地体素全丢。重新拿手杖，调 `resume` 从归档版本灌回本地 `VoxelWorld`（这批会标记成已提交，不会重复发送），然后继续加建。
+- **回滚**：`list_versions` 看可回滚版本 → `revert({"version": 3})`（不填回上一版）→ `get_build_status` 确认写完。
+- 所有查询类工具有 15 秒超时；没拿到回包就重试或检查客户端是否还在存档里。
 
 写入回执（`place_blocks` / `draw_shape` / `remove_blocks`）实际长这样：
 
@@ -118,12 +134,40 @@ url = "http://127.0.0.1:8765/mcp"
 
 ## 形状：没有白名单
 
-`draw_shape` 的 `where` 是任意数学谓词，逐体素求值，为真的格子被填充。变量：
-`x y z`、`cx cy cz`、`rx ry rz`、`x0 y0 z0 x1 y1 z1`、`t`（归一化高度）、`i`、`n`、`pi e`。
-运算符：`+ - * / % ^`、`== != > < >= <=`、`&& || !`、括号、逗号。
-函数：`abs min max floor ceil round sqrt pow sin cos tan atan2 hypot clamp step smoothstep mod sign lerp fract dist dist2 length mix`。
+`draw_shape` 的 `where` 是任意数学谓词，逐体素求值，为真的格子被填充。
 
-`&& || !` 就是任意并集 / 交集 / 差集（CSG）。例：
+下面这段是**纯文本语法表**，故意用代码块而不是行内反引号：某些技能宿主加载文档时会把行内反引号内容交给 shell 执行，导致 `!` 和括号被吞掉。
+
+```text
+变量  : x y z, cx cy cz, rx ry rz, x0 y0 z0 x1 y1 z1, t, i, n, pi, e
+运算符: + - * / % ^, == != > < >= <=, && || !, 括号, 逗号
+函数  : abs min max floor ceil round sqrt pow sin cos tan atan2 hypot
+        clamp step smoothstep mod sign lerp fract dist dist2 length mix
+        grid(v,n) hash3(x,y,z) rand(x,y,z) noise3(x,y,z)
+```
+
+- `^` 是**幂运算**（`x^2` 是平方），不是异或，优先级高于 `* /`。
+- `!` 是逻辑取反；`&& || !` 组合就是任意并集 / 交集 / 差集（CSG）。
+- 比较表达式返回布尔值，不要直接当数字参与算术；组合条件请用 `&&` / `||`。
+- `grid(v,n)` 返回 v 到最近 n 倍数的距离：柱网、窗格、行道树不用再手推 `mod` 技巧。
+- `hash3` / `rand` 是确定性伪随机 `[0,1)`（同坐标恒定）；`noise3` 是三线性插值的平滑 value noise `[0,1)`。树冠深浅斑驳、地形起伏可以直接在 `where` 里表达，不必外部逐格算好再 `place_blocks`。
+
+**变量绑定与几何复用**（避免同一个 `H` 在墙 / 屋顶 / 窗里抄三遍）：
+
+```json
+{"region":[0,64,0,15,80,15],"block":"minecraft:stone_bricks",
+ "vars":{"H":"-52+grid(x,9)*3"},
+ "where":"y<=H && y>=H-4",
+ "clone":{"offset":[20,0,0],"count":4},
+ "mirror":{"axis":"z","at":7.5}}
+```
+
+- `vars` 是 let 绑定：值是数字或表达式，之后 `where` 里直接引用变量名，改周期只改一处。变量名不能覆盖内置变量 / 函数名。
+- `clone` 按 `offset` 把本次几何复制 `count` 份（含原来 1 份，最多 64），副本重叠会自动去重。
+- `mirror` 沿 `axis` 在 `at` 处镜像一份，可与 `clone` 叠加；`shell` 先算外表面再复制。
+- 回执 `note` 会写明实际做了哪些变换。
+
+例：
 
 ```json
 {"name":"draw_shape","arguments":{
@@ -139,23 +183,36 @@ url = "http://127.0.0.1:8765/mcp"
 
 `capture` 在 MCP 下**只返回文本**，不把图片字节发给你。回执里有 `photos`（张数）、`cameras`（每台机位的实际坐标 / yaw / pitch / fov / `insideSolid`）、`localReport`（本地渲染统计）和 `note`，但没有图片内容——MCP 的 `content` 只有 `type:"text"`。外部链路的 `note` 会直接写"照片已落盘到本机"，不会再声称会附图。
 
-照片确实落盘了：
+照片确实落盘了，回执会**直接给出绝对路径**（`captureDir` + `photoPaths` 数组），不需要全盘搜索：
 
+```json
+{"photos":2,
+ "captureDir":"D:/.../builder-captures/<完整 taskId>",
+ "photoPaths":["D:/.../v1-agent1-ai-1-1.png","D:/.../v1-agent1-ai-1-2.png"]}
 ```
-<客户端游戏目录>/builder-captures/<完整 taskId>/v1-agent<N>-<机位id>.png
-```
+
+目录结构是 `<客户端游戏目录>/builder-captures/<完整 taskId>/v1-agent<N>-<机位id>.png`。
 
 文件名用机位 **id** 不是机位名：自定义机位是 `ai-<拍照轮次>-<机位序号>`（如 `v1-agent1-ai-1-1.png`），预设机位是 `v1`/`top`/`eye` 等；客户端链路版本号固定 `v1`。
 
 如果你的环境能读本地文件，可以自己去这个目录列文件、看 PNG；不能读就改用 `read_state` 核对体素，别反复等照片。
 
 相机要点：
-- 一次默认最多 8 台（`visionMaxImages`），可用 `maxCameras` 调整；不填 `cameras` 时用 `view` 预设机位（around/top/eye/all/none）
+- 一次默认最多 8 台（`visionMaxImages`），可用 `maxCameras` 调整；不填 `cameras` 时用 `view` 预设机位：`around` / `top` / `eye` / `all` / `none` / **`plan`**
+- **`view:"plan"` 是正投影俯视**，塔楼顶部不会按透视向外发散；`top` 也默认正交。核对街区位置、判断地面铺没铺上优先用它
+- 也可以传 `orthographic:true` 把任意机位改成正交，`orthoWidth` 指定整幅画面覆盖的世界格数（留空按建筑大小自动推断）；每台 `cameras` 里也能单独设
 - 每台相机给绝对坐标 `x,y,z`，朝向用 `lookAt:[tx,ty,tz]`（最直观）或 `yaw/pitch`（yaw=0 朝 +Z、90 朝 -X，pitch 正值朝下）
 - `fov` 水平视场角 20~110，默认 70；室内建议 85~100
 - 找室内空气位置用 `read_state(detail=region)`：它只列实心方块，没列出的就是空气
-- 回执里 `insideSolid:true` 表示机位卡在方块里，换个位置重拍
-- 照片只渲染本次建造的方块，天空渐变与绿色棋盘格草地是占位背景，**不代表真实地形**
+- 机位落在实心方块里会**自动向上外移**找空气（最多 8 格），找不到就丢弃；回执给 `relocatedCameras` / `droppedCameras`，不用自己重拍
+- 照片只渲染本次建造的方块，天空渐变与**带深色网格的绿色占位地面**是背景，**不代表真实地形**；`groundGrid:false` 可关掉网格
+
+## 颜色与投影
+
+- 草方块 / 菌丝 / 砂土的**顶面**现在是草地绿，树叶 / 草 / 藤蔓用绿色系着色，不再是贴图平均色的土褐 / 灰——俯视能直接判断地面铺没铺上。
+- 离屏渲染拿不到真实生物群系，用的是**典型草原色近似**：沙漠、沼泽、针叶林等生物群系在游戏里的实际颜色仍会有差异；`list_materials` 回执的 `materialDetails` 用 `biomeTinted` 标出这些方块。
+- 樱花树叶保留粉色贴图色，不被绿色覆盖。
+- `view:"plan"` / `orthographic:true` 是正交投影，适合 200×200 这类大范围俯视；默认透视适合看立面与细节。
 
 ## 分段提交（必须遵守）
 
@@ -168,12 +225,14 @@ url = "http://127.0.0.1:8765/mcp"
 
 ## 提交与多轮
 
-- `submit_build` 把本地 `VoxelWorld` 全部方块分批（4096 格/包）发给服务端，最后一批带 `last=true`
-- 服务端收齐后按 `blocksPerTick`（默认 512）逐 tick 写入，全部写完才归档并标 `DONE`
-- 提交后本地世界**保留**，`get_context` 的 `localBlocks` 仍是累计值；可以在其上加建后再提交（服务端覆盖写，重复提交安全）
-- 如果怀疑没写进世界，先看服务端归档日志：正常会写「实际写入 N 格 / 收到 M 格」；只收到不写入会额外给一条 ERROR 说明原因
-- 大工程建议分轮：先搭主体提交一轮，再搭内部提交一轮。每轮都从空本地世界开始，写入是覆盖式的 `setBlock`，所以第二轮只做"加"，不要假设上一轮的东西还在你手里
-- 同一任务同一时刻只有一个客户端会话；多人服务器上只有任务所有者能提交
+- **增量提交**：`submit_build` 只发「相对上次提交发生变化的格子」（4096 格/包，最后一批带 `last=true`），不再全量重发。回执是扁平的 `submitted` / `changed` / `removed` / `localBlocks` / `batches` / `payloadKb`。
+- **删除会传播**：本地从 `VoxelWorld` 移除的格子，会以 `minecraft:air` 自动发给服务端擦除；也可以直接 `place_blocks` 写 `minecraft:air` 显式删除（这是合法用法，之前没写进文档）。
+- **`request_bounds` 会重置本地建模**：若还有未提交的增量，工具会直接拒绝并提示先 `submit_build`，不会静默丢成果。
+- 服务端收齐后按 `blocksPerTick`（默认 512）逐 tick 写入，全部写完才归档并标 `DONE`。
+- 提交后本地世界**保留**：同一 `taskId` 内 `VoxelWorld` 持续累积，**不是每轮从空开始**。`get_context` 的 `localBlocks` 是累计值、`pendingDelta` 是距上次提交新增的格数、`submitCount` 是提交次数。重复提交同一状态会返回 `submitted:0`（无变化），是安全的。
+- 想彻底重来请换一根手杖（新 `taskId`），而不是假设本地会清空。
+- 如果怀疑没写进世界，先看服务端归档日志：正常会写「实际写入 N 格 / 收到 M 格」；只收到不写入会额外给一条 ERROR 说明原因。
+- 同一任务同一时刻只有一个客户端会话；多人服务器上只有任务所有者能提交。
 
 ## 会「自己消失」的方块
 

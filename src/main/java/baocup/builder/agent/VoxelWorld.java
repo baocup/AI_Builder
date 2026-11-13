@@ -114,6 +114,21 @@ public final class VoxelWorld {
         return voxels.size();
     }
 
+    /** 空气体素只是「删除墓碑」，不是真实方块；统计与展示一律排除。 */
+    public static boolean isAir(Voxel v) {
+        return v != null && ("minecraft:air".equals(v.block()) || "air".equals(v.block()));
+    }
+
+    public int realSize() {
+        int count = 0;
+        for (Voxel v : voxels.values()) {
+            if (!isAir(v)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     public Bounds selection() {
         return selection;
     }
@@ -208,7 +223,12 @@ public final class VoxelWorld {
         }
         int[] b = {Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE,
                 Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MIN_VALUE};
+        boolean found = false;
         for (Voxel v : voxels.values()) {
+            if (isAir(v)) {
+                continue;
+            }
+            found = true;
             b[0] = Math.min(b[0], v.x());
             b[1] = Math.min(b[1], v.y());
             b[2] = Math.min(b[2], v.z());
@@ -216,13 +236,15 @@ public final class VoxelWorld {
             b[4] = Math.max(b[4], v.y());
             b[5] = Math.max(b[5], v.z());
         }
-        return b;
+        return found ? b : null;
     }
 
     public Map<String, Integer> materials() {
         Map<String, Integer> counts = new LinkedHashMap<>();
         for (Voxel v : voxels.values()) {
-            counts.merge(v.block(), 1, Integer::sum);
+            if (!isAir(v)) {
+                counts.merge(v.block(), 1, Integer::sum);
+            }
         }
         return counts;
     }
@@ -231,7 +253,9 @@ public final class VoxelWorld {
     public JsonArray layerSummary() {
         Map<Integer, List<Voxel>> byY = new LinkedHashMap<>();
         for (Voxel v : voxels.values()) {
-            byY.computeIfAbsent(v.y(), k -> new ArrayList<>()).add(v);
+            if (!isAir(v)) {
+                byY.computeIfAbsent(v.y(), k -> new ArrayList<>()).add(v);
+            }
         }
         JsonArray layers = new JsonArray();
         for (Map.Entry<Integer, List<Voxel>> e : byY.entrySet()) {

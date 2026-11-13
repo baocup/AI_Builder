@@ -44,8 +44,13 @@ public final class AgentTools {
             变量：x y z（绝对世界整数坐标）、cx cy cz（region 中心）、rx ry rz（region 半尺寸）、
                   x0 y0 z0 x1 y1 z1（region 边界）、t（0~1 的归一化高度）、i（本格子序号）、n（region 总体素数）、pi e。
             运算符：+ - * / % ^、== != > < >= <=、&& || !、括号、逗号。
+                  ^ 是幂运算（x^2 为平方，不是异或），优先级高于乘除；! 是逻辑取反；布尔值不参与算术。
             函数：abs min max floor ceil round sqrt pow sin cos tan atan2 hypot clamp step smoothstep
-                  mod sign lerp fract dist dist2 length mix。
+                  mod sign lerp fract dist dist2 length mix grid hash3 rand noise3。
+                  grid(v,n) 返回 v 到最近 n 倍数的距离（柱网 / 窗格 / 行道树）；
+                  hash3(x,y,z) 与 rand 是确定性伪随机 [0,1)；noise3 是平滑 value noise [0,1)。
+            vars 是 let 绑定：给 {"H":"-52+grid(x,9)*3"} 后，where 里可直接写 y<=H，改公式只改一处。
+            clone 阵列与 mirror 镜像能把同一套几何复制到多个位置，详见参数 schema。
             例如椭球：(x-cx)^2/rx^2+(y-cy)^2/ry^2+(z-cz)^2/rz^2<=1
             圆柱：(x-cx)^2+(z-cz)^2<=rx^2 && y>=y0 && y<=y1
             斜屋顶：y<=y1-(abs(x-cx)/rx)*(y1-y0)*0.6
@@ -123,15 +128,23 @@ public final class AgentTools {
                       "mode":{"type":"string","enum":["set","add","erase","replace"],"description":"默认 set"},
                       "replaceBlock":{"type":"string","description":"mode=replace 时只替换这个方块 id"},
                       "shell":{"type":"boolean","description":"只保留外表面，默认 false"},
+                      "vars":{"type":"object",
+                        "description":"let 绑定：变量名 -> 数字或表达式，如 {\"H\":\"-52+grid(x,9)*3\"}；在 where 里直接引用 H，避免同一公式在墙/屋顶/窗里抄三遍"},
+                      "clone":{"type":"object",
+                        "description":"阵列：{\"offset\":[dx,dy,dz],\"count\":3}，把本次几何按偏移复制 count 份（含原来 1 份），最多 64 份"},
+                      "mirror":{"type":"object",
+                        "description":"镜像：{\"axis\":\"x\"|\"y\"|\"z\",\"at\":坐标}，把本次几何沿该轴镜像一份；可与 clone 叠加"},
                       "state":{"type":"string","description":"可选 BlockState 属性串"}
                     },"required":["region","block"]}
                     """),
             new Tool(REMOVE_BLOCKS, """
                     局部删除方块，用于修正出错的小区域，**不要用它清空整栋建筑重来**。
                     可以给出 blocks 坐标列表，或给出 region + where / shape 只删满足条件的格子。
-                    只给 region 而不给 where / shape 会被拒绝（防止误删整片）；确实要清空整个 region
-                    时显式传 all=true。单次删除有格数上限，超出会被回报为 rejected。
-                    删除前建议先 read_state(detail=region) 确认范围；结果会回报实际删除数与剩余总格数。
+                    也可以按方块类型删除：block="minecraft:oak_log"（或 blockIds 数组），
+                    单独使用时删除本地世界里所有该类型方块，配合 region/where 时只删交集。
+                    只给 region 而不给 where / shape / block 会被拒绝（防止误删整片）；
+                    确实要清空整个 region 时显式传 all=true。单次删除有格数上限，超出会回报为 rejected。
+                    删除前建议先 read_state(detail=region) 确认范围；结果回报实际删除数与剩余总格数。
                     """, """
                     {"type":"object","properties":{
                       "blocks":{"type":"array","items":{"type":"array","minItems":3,"maxItems":3},
@@ -140,6 +153,9 @@ public final class AgentTools {
                       "where":{"type":"string","description":"谓词，只删满足条件的格子"},
                       "shape":{"type":"string","description":"快捷形状，配合 params 使用"},
                       "params":{"type":"object","description":"快捷形状参数"},
+                      "block":{"type":"string","description":"只删这个方块 id；单独用可清掉该类型的所有格子"},
+                      "blockIds":{"type":"array","items":{"type":"string"},
+                        "description":"一次删多种方块 id"},
                       "all":{"type":"boolean","description":"确要清空整个 region 时显式设为 true，默认 false"}
                     },"required":[]}
                     """),
@@ -176,8 +192,14 @@ public final class AgentTools {
                           "fov":{"type":"number","description":"水平视场角 20~110，默认 70；室内建议 85~100"},
                           "reason":{"type":"string","description":"这台相机想核对什么"}
                         },"required":["x","y","z"]}},
-                      "view":{"type":"string","enum":["around","top","eye","all","none"],
-                        "description":"不填 cameras 时使用的预设机位；默认 around"},
+                      "view":{"type":"string","enum":["around","top","eye","all","none","plan"],
+                        "description":"不填 cameras 时的预设机位；plan = 正投影俯视（街区位置不会透视发散），top 也默认正交"},
+                      "orthographic":{"type":"boolean",
+                        "description":"正交投影；默认透视。俯视 200×200 这类大范围时建议 true"},
+                      "orthoWidth":{"type":"number",
+                        "description":"正交时整幅画面覆盖的世界格数（垂直方向），留空按建筑大小自动推断"},
+                      "groundGrid":{"type":"boolean",
+                        "description":"占位地面是否画明显格线，默认 true；俯视时用它判断地面有没有铺满"},
                       "maxCameras":{"type":"integer","description":"最多拍几台，默认按 visionMaxImages"},
                       "reason":{"type":"string","description":"这次拍照的整体目的"}
                     },"required":[]}

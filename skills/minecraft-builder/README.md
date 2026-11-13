@@ -37,9 +37,9 @@
 
 ## 工具一览
 
-共 9 个：`get_context`、`request_bounds`、`read_state`、`list_materials`、`place_blocks`、`draw_shape`、`remove_blocks`、`capture`、`submit_build`。
+共 14 个：`get_context`、`request_bounds`、`read_state`、`read_world`、`get_build_status`、`resume`、`list_versions`、`revert`、`list_materials`、`place_blocks`、`draw_shape`、`remove_blocks`、`capture`、`submit_build`。
 
-**没有任何工具接受 `taskId`**：它们永远作用在"玩家当前手持的那根手杖"上。早期服务端版的那套工具已全部移除，只剩这 9 个。
+**没有任何工具接受 `taskId`**：它们永远作用在"玩家当前手持的那根手杖"上。早期服务端版的那套工具已全部移除，现在是上面这 14 个。
 
 ## 配置
 
